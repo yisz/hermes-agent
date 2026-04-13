@@ -1279,6 +1279,7 @@ class AIAgent:
                     continue
                 _cp_url = (_cp_entry.get("base_url") or "").rstrip("/")
                 if _cp_url and _cp_url == self.base_url.rstrip("/"):
+                    # Per-model context_length (models -> model_name -> context_length)
                     _cp_models = _cp_entry.get("models", {})
                     if isinstance(_cp_models, dict):
                         _cp_model_cfg = _cp_models.get(self.model, {})
@@ -1289,6 +1290,14 @@ class AIAgent:
                                     _config_context_length = int(_cp_ctx)
                                 except (TypeError, ValueError):
                                     pass
+                    # Provider-level context_length fallback (applies to all models at this endpoint)
+                    if _config_context_length is None:
+                        _cp_ctx = _cp_entry.get("context_length")
+                        if _cp_ctx is not None:
+                            try:
+                                _config_context_length = int(_cp_ctx)
+                            except (TypeError, ValueError):
+                                pass
                     break
         
         # Select context engine: config-driven (like memory providers).

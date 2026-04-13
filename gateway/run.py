@@ -3342,6 +3342,7 @@ class GatewayRunner:
                                 continue
                             _cp_url = (_cp.get("base_url") or "").rstrip("/")
                             if _cp_url and _cp_url == _hyg_base_url.rstrip("/"):
+                                # Per-model context_length (models -> model_name -> context_length)
                                 _cp_models = _cp.get("models", {})
                                 if isinstance(_cp_models, dict):
                                     _cp_model_cfg = _cp_models.get(_hyg_model, {})
@@ -3349,6 +3350,11 @@ class GatewayRunner:
                                         _cp_ctx = _cp_model_cfg.get("context_length")
                                         if _cp_ctx is not None:
                                             _hyg_config_context_length = int(_cp_ctx)
+                                # Provider-level context_length fallback (applies to all models at this endpoint)
+                                if _hyg_config_context_length is None:
+                                    _cp_ctx = _cp.get("context_length")
+                                    if _cp_ctx is not None:
+                                        _hyg_config_context_length = int(_cp_ctx)
                                 break
                     except (TypeError, ValueError):
                         pass
