@@ -200,6 +200,14 @@ TOOL_CATEGORIES = {
                 ],
             },
             {
+                "name": "Perplexity",
+                "tag": "Real-time web search with ranked results (Search API)",
+                "web_backend": "perplexity",
+                "env_vars": [
+                    {"key": "PERPLEXITY_API_KEY", "prompt": "Perplexity API key", "url": "https://www.perplexity.ai/settings/api"},
+                ],
+            },
+            {
                 "name": "Tavily",
                 "tag": "AI-native search, extract, and crawl",
                 "web_backend": "tavily",

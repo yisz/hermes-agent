@@ -88,13 +88,14 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "perplexity"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Firecrawl also counts as available when the managed
     # tool gateway is configured for Nous subscribers.
     backend_candidates = (
+        ("perplexity", _has_env("PERPLEXITY_API_KEY")),
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
@@ -117,6 +118,8 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "perplexity":
+        return _has_env("PERPLEXITY_API_KEY")
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -189,6 +192,7 @@ def _web_requires_env() -> list[str]:
         "TAVILY_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
+        "PERPLEXITY_API_KEY",
     ]
     if managed_nous_tools_enabled():
         requires.extend(
@@ -955,6 +959,78 @@ def _exa_extract(urls: List[str]) -> List[Dict[str, Any]]:
     return results
 
 
+# ─── Perplexity Search Helper ──────────────────────────────────────────────
+
+_PERPLEXITY_SEARCH_URL = "https://api.perplexity.ai/search"
+
+
+def _perplexity_search(query: str, limit: int = 10) -> dict:
+    """Search using the Perplexity Search API and return results as a dict.
+
+    Uses the POST /search endpoint (https://api.perplexity.ai/search).
+    Returns results in the standard Hermes web search format.
+
+    Args:
+        query: The search query string.
+        limit: Maximum number of results to return (1-20).
+
+    Returns:
+        dict with ``success`` and ``data.web`` list of result dicts.
+    """
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    api_key = os.getenv("PERPLEXITY_API_KEY", "").strip()
+    if not api_key:
+        return {"success": False, "error": "PERPLEXITY_API_KEY not set"}
+
+    limit = max(1, min(limit, 20))
+    logger.info("Perplexity search: '%s' (limit=%d)", query, limit)
+
+    payload = {
+        "query": query,
+        "max_results": limit,
+        "max_tokens_per_page": 4096,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = httpx.post(
+            _PERPLEXITY_SEARCH_URL,
+            json=payload,
+            headers=headers,
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        logger.error("Perplexity search HTTP error: %s %s", exc.response.status_code, exc.response.text[:500])
+        return {"success": False, "error": f"Perplexity API error {exc.response.status_code}: {exc.response.text[:200]}"}
+    except httpx.RequestError as exc:
+        logger.error("Perplexity search request error: %s", exc)
+        return {"success": False, "error": f"Perplexity request failed: {exc}"}
+
+    data = resp.json()
+    raw_results = data.get("results", [])
+
+    web_results = []
+    for i, result in enumerate(raw_results):
+        web_results.append({
+            "url": result.get("url", ""),
+            "title": result.get("title", ""),
+            "description": result.get("snippet", ""),
+            "date": result.get("date", ""),
+            "position": i + 1,
+        })
+
+    logger.info("Perplexity search returned %d results", len(web_results))
+    return {"success": True, "data": {"web": web_results}}
+
+
 # ─── Parallel Search & Extract Helpers ────────────────────────────────────────
 
 def _parallel_search(query: str, limit: int = 5) -> dict:
@@ -1083,6 +1159,15 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         # Dispatch to the configured backend
         backend = _get_backend()
+        if backend == "perplexity":
+            response_data = _perplexity_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         if backend == "parallel":
             response_data = _parallel_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
@@ -1921,9 +2006,9 @@ def check_firecrawl_api_key() -> bool:
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily"):
+    if configured in ("exa", "parallel", "firecrawl", "tavily", "perplexity"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
+    return any(_is_backend_available(backend) for backend in ("perplexity", "exa", "parallel", "firecrawl", "tavily"))
 
 
 def check_auxiliary_model() -> bool:
