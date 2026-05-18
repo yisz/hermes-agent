@@ -156,6 +156,7 @@ def _get_backend() -> str:
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
+        ("perplexity", _has_env("PERPLEXITY_API_KEY")),
     )
     for backend, available in backend_candidates:
         if available:
@@ -218,6 +219,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("BRAVE_SEARCH_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
+    if backend == "perplexity":
+        return _has_env("PERPLEXITY_API_KEY")
     return False
 
 
@@ -267,6 +270,8 @@ def _web_requires_env() -> list[str]:
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
+        "PERPLEXITY_API_KEY",
+        "PERPLEXITY_API_URL",
     ]
 
 
