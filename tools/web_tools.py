@@ -140,7 +140,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs"}:
+    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "perplexity"}:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -736,6 +736,131 @@ def clean_base64_images(text: str) -> str:
 #   - plugins/web/parallel/provider.py
 # Both plugins register through agent.web_search_registry and the
 # dispatchers in this file resolve them via get_active_*_provider().
+
+# ─── Perplexity Search Helper ──────────────────────────────────────────────
+
+_PERPLEXITY_DEFAULT_API_URL = "https://api.perplexity.ai"
+
+
+def _perplexity_base_url() -> str:
+    """Return the Perplexity API base URL, configurable via PERPLEXITY_API_URL.
+
+    Allows overriding for self-hosted or proxy deployments, matching the
+    pattern used by FIRECRAWL_API_URL.
+    """
+    return os.getenv("PERPLEXITY_API_URL", "").strip().rstrip("/") or _PERPLEXITY_DEFAULT_API_URL
+
+
+def _normalize_perplexity_search_results(data: dict) -> dict:
+    """Normalize Perplexity /search response to the standard web search format.
+
+    Perplexity returns ``{id: str, results: [{title, url, snippet, date}]}``.
+    We map to ``{success: bool, data: {web: [{title, url, description, date, position}]}}``.
+    """
+    raw_results = data.get("results", [])
+    if not isinstance(raw_results, list):
+        raw_results = []
+
+    web_results = []
+    for i, result in enumerate(raw_results):
+        if not isinstance(result, dict):
+            continue
+        url = result.get("url", "") or ""
+        title = result.get("title", "") or ""
+        snippet = result.get("snippet", "") or ""
+        date = result.get("date", "") or ""
+        # Skip results missing both URL and title — not useful for the agent
+        if not url and not title:
+            continue
+        web_results.append({
+            "url": url,
+            "title": title,
+            "description": snippet,
+            "date": date,
+            "position": i + 1,
+        })
+
+    return {"success": True, "data": {"web": web_results}}
+
+
+def _perplexity_search(query: str, limit: int = 10) -> dict:
+    """Search using the Perplexity Search API and return results as a dict.
+
+    Uses the POST /search endpoint on the Perplexity API.
+    Returns results in the standard Hermes web search format.
+
+    Perplexity Search API returns ranked results with title, url, snippet,
+    and date — no LLM-generated summaries. It is a search-only backend;
+    web_extract and web_crawl are not supported.
+
+    Args:
+        query: The search query string.
+        limit: Maximum number of results to return (1-20, API max is 20).
+
+    Returns:
+        dict with ``success`` and ``data.web`` list of result dicts.
+    """
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    api_key = os.getenv("PERPLEXITY_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "success": False,
+            "error": "PERPLEXITY_API_KEY not set. Get an API key at https://www.perplexity.ai/settings/api",
+        }
+
+    limit = max(1, min(limit, 20))
+    base_url = _perplexity_base_url()
+    search_url = f"{base_url}/search"
+    logger.info("Perplexity search: '%s' (limit=%d)", query, limit)
+
+    payload = {
+        "query": query,
+        "max_results": limit,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = httpx.post(
+            search_url,
+            json=payload,
+            headers=headers,
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        error_text = exc.response.text[:200] if exc.response.text else ""
+        logger.error("Perplexity search HTTP error: %s %s", status_code, error_text)
+        
+        # Provide helpful error messages for common cases
+        if status_code == 401:
+            return {"success": False, "error": f"Perplexity authentication failed (401): check your PERPLEXITY_API_KEY"}
+        if status_code == 429:
+            retry_after = exc.response.headers.get("retry-after", "")
+            if retry_after:
+                return {"success": False, "error": f"Perplexity rate limit exceeded (429). Retry after {retry_after} seconds."}
+            return {"success": False, "error": f"Perplexity rate limit exceeded (429). Please wait before retrying."}
+        if status_code >= 500:
+            return {"success": False, "error": f"Perplexity server error ({status_code}). Please try again later."}
+        return {"success": False, "error": f"Perplexity API error {status_code}: {error_text}"}
+    except httpx.RequestError as exc:
+        logger.error("Perplexity search request error: %s", exc)
+        return {"success": False, "error": f"Perplexity request failed: {exc}"}
+
+    try:
+        data = resp.json()
+    except json.JSONDecodeError:
+        logger.error("Perplexity returned invalid JSON")
+        return {"success": False, "error": "Perplexity returned invalid JSON. Please try again."}
+    
+    return _normalize_perplexity_search_results(data)
 
 
 def web_search_tool(query: str, limit: int = 5) -> str:
