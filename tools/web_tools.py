@@ -140,7 +140,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}:
+    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "perplexity", "xai"}:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -156,6 +156,7 @@ def _get_backend() -> str:
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
+        ("perplexity", _has_env("PERPLEXITY_API_KEY")),
     )
     for backend, available in backend_candidates:
         if available:
@@ -218,6 +219,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("BRAVE_SEARCH_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
+    if backend == "perplexity":
+        return _has_env("PERPLEXITY_API_KEY")
     if backend == "xai":
         # Cheap probe — env var OR auth.json has OAuth tokens. Must not
         # call resolve_xai_http_credentials() here because the OAuth path
@@ -277,6 +280,8 @@ def _web_requires_env() -> list[str]:
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
+        "PERPLEXITY_API_KEY",
+        "PERPLEXITY_API_URL",
     ]
 
 
@@ -743,6 +748,132 @@ def clean_base64_images(text: str) -> str:
 # dispatchers in this file resolve them via get_active_*_provider().
 
 
+# ─── Perplexity Search Helper ──────────────────────────────────────────────
+
+_PERPLEXITY_DEFAULT_API_URL = "https://api.perplexity.ai"
+
+
+def _perplexity_base_url() -> str:
+    """Return the Perplexity API base URL, configurable via PERPLEXITY_API_URL.
+
+    Allows overriding for self-hosted or proxy deployments, matching the
+    pattern used by FIRECRAWL_API_URL.
+    """
+    return os.getenv("PERPLEXITY_API_URL", "").strip().rstrip("/") or _PERPLEXITY_DEFAULT_API_URL
+
+
+def _normalize_perplexity_search_results(data: dict) -> dict:
+    """Normalize Perplexity /search response to the standard web search format.
+
+    Perplexity returns ``{id: str, results: [{title, url, snippet, date}]}``.
+    We map to ``{success: bool, data: {web: [{title, url, description, date, position}]}}``.
+    """
+    raw_results = data.get("results", [])
+    if not isinstance(raw_results, list):
+        raw_results = []
+
+    web_results = []
+    for i, result in enumerate(raw_results):
+        if not isinstance(result, dict):
+            continue
+        url = result.get("url", "") or ""
+        title = result.get("title", "") or ""
+        snippet = result.get("snippet", "") or ""
+        date = result.get("date", "") or ""
+        # Skip results missing both URL and title — not useful for the agent
+        if not url and not title:
+            continue
+        web_results.append({
+            "url": url,
+            "title": title,
+            "description": snippet,
+            "date": date,
+            "position": i + 1,
+        })
+
+    return {"success": True, "data": {"web": web_results}}
+
+
+def _perplexity_search(query: str, limit: int = 10) -> dict:
+    """Search using the Perplexity Search API and return results as a dict.
+
+    Uses the POST /search endpoint on the Perplexity API.
+    Returns results in the standard Hermes web search format.
+
+    Perplexity Search API returns ranked results with title, url, snippet,
+    and date — no LLM-generated summaries. It is a search-only backend;
+    web_extract and web_crawl are not supported.
+
+    Args:
+        query: The search query string.
+        limit: Maximum number of results to return (1-20, API max is 20).
+
+    Returns:
+        dict with ``success`` and ``data.web`` list of result dicts.
+    """
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    api_key = os.getenv("PERPLEXITY_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "success": False,
+            "error": "PERPLEXITY_API_KEY not set. Get an API key at https://www.perplexity.ai/settings/api",
+        }
+
+    limit = max(1, min(limit, 20))
+    base_url = _perplexity_base_url()
+    search_url = f"{base_url}/search"
+    logger.info("Perplexity search: '%s' (limit=%d)", query, limit)
+
+    payload = {
+        "query": query,
+        "max_results": limit,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = httpx.post(
+            search_url,
+            json=payload,
+            headers=headers,
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        error_text = exc.response.text[:200] if exc.response.text else ""
+        logger.error("Perplexity search HTTP error: %s %s", status_code, error_text)
+
+        # Provide helpful error messages for common cases
+        if status_code == 401:
+            return {"success": False, "error": f"Perplexity authentication failed (401): check your PERPLEXITY_API_KEY"}
+        if status_code == 429:
+            retry_after = exc.response.headers.get("retry-after", "")
+            if retry_after:
+                return {"success": False, "error": f"Perplexity rate limit exceeded (429). Retry after {retry_after} seconds."}
+            return {"success": False, "error": f"Perplexity rate limit exceeded (429). Please wait before retrying."}
+        if status_code >= 500:
+            return {"success": False, "error": f"Perplexity server error ({status_code}). Please try again later."}
+        return {"success": False, "error": f"Perplexity API error {status_code}: {error_text}"}
+    except httpx.RequestError as exc:
+        logger.error("Perplexity search request error: %s", exc)
+        return {"success": False, "error": f"Perplexity request failed: {exc}"}
+
+    try:
+        data = resp.json()
+    except json.JSONDecodeError:
+        logger.error("Perplexity returned invalid JSON")
+        return {"success": False, "error": "Perplexity returned invalid JSON. Please try again."}
+
+    return _normalize_perplexity_search_results(data)
+
+
 def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search the web for information using available search API backend.
@@ -809,27 +940,33 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         )
 
         backend = _get_search_backend()
-        provider = _wsp_get_provider(backend) if backend else None
-        if provider is None or not provider.supports_search():
-            # Fall back to availability-walked active provider when the
-            # configured backend isn't a registered search provider (typo,
-            # uninstalled plugin, or capability mismatch).
-            provider = get_active_search_provider()
 
-        if provider is None:
-            response_data = {
-                "success": False,
-                "error": (
-                    "No web search provider configured. "
-                    "Run `hermes tools` to set one up."
-                ),
-            }
+        # Perplexity is an inline backend (not yet a plugin), so
+        # handle it directly when selected.
+        if backend == "perplexity":
+            response_data = _perplexity_search(query, limit)
         else:
-            logger.info(
-                "Web search via %s: '%s' (limit: %d)",
-                provider.name, query, limit,
-            )
-            response_data = provider.search(query, limit)
+            provider = _wsp_get_provider(backend) if backend else None
+            if provider is None or not provider.supports_search():
+                # Fall back to availability-walked active provider when the
+                # configured backend isn't a registered search provider (typo,
+                # uninstalled plugin, or capability mismatch).
+                provider = get_active_search_provider()
+
+            if provider is None:
+                response_data = {
+                    "success": False,
+                    "error": (
+                        "No web search provider configured. "
+                        "Run `hermes tools` to set one up."
+                    ),
+                }
+            else:
+                logger.info(
+                    "Web search via %s: '%s' (limit: %d)",
+                    provider.name, query, limit,
+                )
+                response_data = provider.search(query, limit)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -1367,11 +1504,11 @@ async def web_crawl_tool(
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs"}:
+    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "perplexity"}:
         return _is_backend_available(configured)
     return any(
         _is_backend_available(backend)
-        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs")
+        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "perplexity")
     )
 
 
@@ -1413,6 +1550,8 @@ if __name__ == "__main__":
             print("   Using Brave Search free tier (search only)")
         elif backend == "ddgs":
             print("   Using DuckDuckGo via ddgs package (search only)")
+        elif backend == "perplexity":
+            print("   Using Perplexity Search API (search only)")
         elif firecrawl_url_available:
             print(f"   Using self-hosted Firecrawl: {os.getenv('FIRECRAWL_API_URL').strip().rstrip('/')}")
         elif firecrawl_key_available:
