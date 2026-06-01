@@ -130,7 +130,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}:
+    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "perplexity"}:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -145,6 +145,7 @@ def _get_backend() -> str:
         ("exa", _has_env("EXA_API_KEY")),
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
+        ("perplexity", _has_env("PERPLEXITY_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
     )
     for backend, available in backend_candidates:
@@ -206,6 +207,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("SEARXNG_URL")
     if backend == "brave-free":
         return _has_env("BRAVE_SEARCH_API_KEY")
+    if backend == "perplexity":
+        return _has_env("PERPLEXITY_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
     if backend == "xai":
@@ -267,6 +270,8 @@ def _web_requires_env() -> list[str]:
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
+        "PERPLEXITY_API_KEY",
+        "PERPLEXITY_API_URL",
     ]
 
 
@@ -1155,11 +1160,11 @@ async def web_extract_tool(
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs"}:
+    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "perplexity"}:
         return _is_backend_available(configured)
     return any(
         _is_backend_available(backend)
-        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs")
+        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "perplexity")
     )
 
 
@@ -1199,6 +1204,8 @@ if __name__ == "__main__":
             print(f"   Using SearXNG (search only): {os.getenv('SEARXNG_URL', '').strip()}")
         elif backend == "brave-free":
             print("   Using Brave Search free tier (search only)")
+        elif backend == "perplexity":
+            print("   Using Perplexity Search API (search only)")
         elif backend == "ddgs":
             print("   Using DuckDuckGo via ddgs package (search only)")
         elif firecrawl_url_available:
@@ -1212,7 +1219,7 @@ if __name__ == "__main__":
     else:
         print("❌ No web search backend configured")
         print(
-            "Set EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_API_URL"
+            "Set EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_API_URL, PERPLEXITY_API_KEY"
             f"{_firecrawl_backend_help_suffix()}"
         )
 
